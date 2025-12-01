@@ -4,3 +4,10 @@ data/
 analysis_results.csv
 .env
 .DS_Store
+
+# Reports & Notes
+latest_report.txt
+backtest_summary.txt
+routine_and_stats.md
+output.txt
+output_targets.txt

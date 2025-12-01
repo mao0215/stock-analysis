@@ -54,36 +54,34 @@ def calculate_macd(series, fast=12, slow=26, signal=9):
 
 def simulate_trade(df, entry_idx, tp_pct=0.10, sl_pct=0.05, max_days=10):
     """
-    個別のトレードシミュレーション（ループ処理だが、バックテスト時のみ実行）
-    利確(TP)と損切(SL)のどちらに先にヒットするか判定
+    個別のトレードシミュレーション
+    戻り値: (リターン, 保有日数)
     """
     entry_price = df.iloc[entry_idx]['Close']
     tp_price = entry_price * (1 + tp_pct)
     sl_price = entry_price * (1 - sl_pct)
     
-    # 未来のデータを取得
     future_df = df.iloc[entry_idx+1 : entry_idx+1+max_days]
     
     if future_df.empty:
-        return 0.0 # データ不足
+        return 0.0, 0
         
-    for _, row in future_df.iterrows():
-        # 高値がTPを超えたか？
+    days_held = 0
+    for i, row in future_df.iterrows():
+        days_held += 1
+        # HighがTP超え
         if row['High'] >= tp_price:
-            # ただし、同じ日に安値がSLを割っている可能性もある（ヒゲ）
-            # 厳密には分足が必要だが、ここでは「始値に近い方」や「保守的にSL優先」などで判定
-            # 今回はシンプルに「LowがSL割ってたらSL優先」とする（保守的）
             if row['Low'] <= sl_price:
-                return -sl_pct
-            return tp_pct
+                return -sl_pct, days_held
+            return tp_pct, days_held
             
-        # 安値がSLを割ったか？
+        # LowがSL割れ
         if row['Low'] <= sl_price:
-            return -sl_pct
+            return -sl_pct, days_held
             
-    # 期間内にどちらもヒットしなかった場合、最終日の終値で決済
+    # 期限切れ
     exit_price = future_df.iloc[-1]['Close']
-    return (exit_price / entry_price) - 1.0
+    return (exit_price / entry_price) - 1.0, days_held
 
 def calculate_vectorized_conditions(df, params):
     """
@@ -117,6 +115,12 @@ def calculate_vectorized_conditions(df, params):
     c5 = avg_vol_up > avg_vol_down
     
     # --- Cond 6: 週足分析 (Resample & Broadcast) ---
+    weekly_df = df.set_index('Date').resample('W').agg({
+        'Close': 'last', 'Volume': 'sum'
+    })
+    weekly_diff = df['Close'].diff() # Note: This logic was slightly different in original but let's stick to working logic. 
+    # Wait, original logic for c6 was complex. Let's use the one from view_file output which seemed correct.
+    # Re-implementing c6 logic carefully from previous view_file output.
     weekly_df = df.set_index('Date').resample('W').agg({
         'Close': 'last', 'Volume': 'sum'
     })
@@ -204,36 +208,37 @@ def process_ticker(ticker, params):
         score_series = vec_res['score']
         
         # --- バックテスト集計 (出口戦略あり) ---
-        # ループ処理になるが、対象となる「高スコアの日」は少ないので高速
         backtest_stats = {}
         
-        # 設定: 利確+10%, 損切-5%, 保有10日
         TP = 0.10
         SL = 0.05
         HOLD_DAYS = 10
         
         for s in [7, 8, 9]:
-            # そのスコアの日付インデックスを取得
             indices = np.where(score_series == s)[0]
             
             returns = []
+            durations = []
             for idx in indices:
-                # 最終日付近はシミュレーションできないのでスキップ
                 if idx >= len(df) - 1:
                     continue
                     
-                ret = simulate_trade(df, idx, tp_pct=TP, sl_pct=SL, max_days=HOLD_DAYS)
+                ret, duration = simulate_trade(df, idx, tp_pct=TP, sl_pct=SL, max_days=HOLD_DAYS)
                 returns.append(ret)
+                durations.append(duration)
             
             returns = np.array(returns)
+            durations = np.array(durations)
+            
             if len(returns) > 0:
                 backtest_stats[s] = {
                     'count': len(returns),
                     'win_count': (returns > 0).sum(),
-                    'total_return': returns.sum()
+                    'total_return': returns.sum(),
+                    'total_days': durations.sum()
                 }
             else:
-                backtest_stats[s] = {'count': 0, 'win_count': 0, 'total_return': 0.0}
+                backtest_stats[s] = {'count': 0, 'win_count': 0, 'total_return': 0.0, 'total_days': 0}
         
         # --- 最新の状態 ---
         current_score = score_series.iloc[-1]
@@ -256,6 +261,21 @@ def process_ticker(ticker, params):
             signal_start = df.iloc[start_idx]['Date']
             start_str = signal_start.strftime('%Y-%m-%d')
             
+            # --- 厳選フィルター (Elite判定) ---
+            # 1. Freshness: シグナル点灯から3日以内
+            # 2. Volume Surge: 直近出来高 > 50日平均出来高 * 1.2 (緩和)
+            
+            # 営業日ベースでの経過日数計算
+            days_since_start = len(df) - 1 - start_idx
+            is_fresh = days_since_start <= 3
+            
+            # 出来高急増判定
+            current_vol = df.iloc[-1]['Volume']
+            avg_vol_50 = df['Volume'].rolling(window=50).mean().iloc[-1]
+            is_vol_surge = current_vol > (avg_vol_50 * 1.2)
+            
+            is_elite = (current_score == 9) and is_fresh and is_vol_surge
+            
             met_conditions = []
             for k in ['c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c8', 'c9']:
                 if vec_res[k].iloc[-1]:
@@ -272,6 +292,9 @@ def process_ticker(ticker, params):
                 'Date': date_str,
                 'Signal_Start': start_str,
                 'Score': current_score,
+                'Is_Elite': is_elite,
+                'Is_Fresh': is_fresh,
+                'Is_Vol_Surge': is_vol_surge,
                 'Target_Price': target_price,
                 'Stop_Loss': stop_loss_price,
                 'Met_Conditions': met_conditions
@@ -282,12 +305,12 @@ def process_ticker(ticker, params):
             'backtest': backtest_stats
         }
             
-    except Exception:
+    except Exception as e:
+        print(f"Error processing {ticker}: {e}")
         return None
-    return None
 
 def main():
-    print("分析を開始します（出口戦略バックテスト版）...")
+    print("分析を開始します（厳選フィルター調整版）...")
     print("設定: 利確+10%, 損切-5%, 保有期間10日")
     start_time = time.time()
     
@@ -299,9 +322,9 @@ def main():
     results = []
     
     global_backtest = {
-        7: {'total_trades': 0, 'wins': 0, 'total_return_sum': 0.0},
-        8: {'total_trades': 0, 'wins': 0, 'total_return_sum': 0.0},
-        9: {'total_trades': 0, 'wins': 0, 'total_return_sum': 0.0}
+        7: {'total_trades': 0, 'wins': 0, 'total_return_sum': 0.0, 'total_days': 0},
+        8: {'total_trades': 0, 'wins': 0, 'total_return_sum': 0.0, 'total_days': 0},
+        9: {'total_trades': 0, 'wins': 0, 'total_return_sum': 0.0, 'total_days': 0}
     }
     
     with concurrent.futures.ProcessPoolExecutor() as executor:
@@ -322,12 +345,14 @@ def main():
                         global_backtest[s]['total_trades'] += bt_stats[s]['count']
                         global_backtest[s]['wins'] += bt_stats[s]['win_count']
                         global_backtest[s]['total_return_sum'] += bt_stats[s]['total_return']
+                        global_backtest[s]['total_days'] += bt_stats[s]['total_days']
             
             completed_count += 1
             if completed_count % 1000 == 0:
                 print(f"進捗: {completed_count}/{total_count}")
 
-    results.sort(key=lambda x: x['Score'], reverse=True)
+    # Elite銘柄を優先してソート (Is_Elite True -> Score Desc)
+    results.sort(key=lambda x: (x.get('Is_Elite', False), x['Score']), reverse=True)
     
     # --- 結果出力 ---
     output_lines = []
@@ -348,21 +373,32 @@ def main():
         if stats['total_trades'] > 0:
             win_rate = (stats['wins'] / stats['total_trades']) * 100
             avg_return = (stats['total_return_sum'] / stats['total_trades']) * 100
+            avg_days = stats['total_days'] / stats['total_trades']
             log(f"総取引回数: {stats['total_trades']} 回")
             log(f"勝率 (プラス決済): {win_rate:.2f}%")
             log(f"平均リターン (1トレードあたり): {avg_return:.2f}%")
+            log(f"平均保有期間: {avg_days:.1f} 日")
         else:
             log("該当する取引データがありませんでした。")
             
     log("==========================================\n")
     
+    # Elite銘柄のカウント
+    elite_results = [r for r in results if r.get('Is_Elite', False)]
+    fresh_results = [r for r in results if r.get('Is_Fresh', False) and r['Score'] == 9]
+    vol_surge_results = [r for r in results if r.get('Is_Vol_Surge', False) and r['Score'] == 9]
+    
     log(f"条件を7つ以上満たした銘柄: {len(results)} 件")
+    log(f"うち Score 9 銘柄: {len([r for r in results if r['Score'] == 9])} 件")
+    log(f"  - 初動 (3日以内): {len(fresh_results)} 件")
+    log(f"  - 出来高急増 (>1.2倍): {len(vol_surge_results)} 件")
+    log(f"  - 厳選銘柄 (全部入り): {len(elite_results)} 件")
     
     if results:
+        # Top 20表示 (Elite優先)
         res_df_top = pd.DataFrame(results[:20])
-        # 表示列を絞り込む
-        display_cols = ['Ticker', 'Price', 'Target_Price', 'Stop_Loss', 'Score']
-        log("\n=== 推奨売買価格 (Top 20) ===")
+        display_cols = ['Ticker', 'Price', 'Score', 'Signal_Start', 'Is_Elite', 'Target_Price', 'Stop_Loss']
+        log("\n=== 推奨売買価格 (Top 20: 厳選銘柄優先) ===")
         log(res_df_top[display_cols].to_string(index=False))
         
         res_df_all = pd.DataFrame(results)
@@ -376,5 +412,5 @@ def main():
         f.write("\n".join(output_lines))
     print("\n詳細レポートを latest_report.txt に保存しました。")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
